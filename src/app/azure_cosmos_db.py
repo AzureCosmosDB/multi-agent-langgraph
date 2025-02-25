@@ -8,33 +8,31 @@ from typing import List, Optional
 from azure.cosmos import ContainerProxy
 from azure.cosmos import exceptions
 from azure.cosmos import CosmosClient, PartitionKey
-
-from src.app import azure_open_ai
+from azure_open_ai import generate_embedding
 from pathlib import Path
 
-# Azure Cosmos DB configuration
+# Environment variables
 COSMOS_DB_URL = os.getenv("COSMOSDB_ENDPOINT")
 COSMOS_DB_KEY = os.getenv("COSMOSDB_KEY")
-DATABASE_NAME = "CosmosMultiAgentLangGraph"
-CHECKPOINT_CONTAINER = "Chat"
-
-cosmos_client = None
-database = None
-container = None
-
-# Define Cosmos DB container for user data
-USERDATA_CONTAINER = "UserData"
-userdata_container = None
-account_container = None
-
 AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+
+# Cosmos DB Database and Container names
 PRODUCTS_CONTAINER = "Products"
 USERS_CONTAINER = "Users"
 PURCHASE_HISTORY_CONTAINER = "PurchaseHistory"
+DATABASE_NAME = "CosmosMultiAgentLangGraph"
+USERDATA_CONTAINER = "UserData"
+CHECKPOINT_CONTAINER = "Chat"
 
+# Initialize Cosmos DB client, database, and container variables
+cosmos_client = None
+database = None
+container = None
+userdata_container = None
 client = None
 
 
+# Initialize Cosmos DB client
 def get_cosmos_client():
     global cosmos_client
     if cosmos_client is None:
@@ -42,18 +40,12 @@ def get_cosmos_client():
     return cosmos_client
 
 
-# Initialize Cosmos DB client
 try:
     client = get_cosmos_client()
     database = client.create_database_if_not_exists(DATABASE_NAME)
     container = database.create_container_if_not_exists(
         id=CHECKPOINT_CONTAINER,
         partition_key=PartitionKey(path="/partition_key"),
-        offer_throughput=400,
-    )
-    account_container = database.create_container_if_not_exists(
-        id="Account",
-        partition_key=PartitionKey(path="/accountId"),
         offer_throughput=400,
     )
     print(f"[DEBUG] Connected to Cosmos DB: {DATABASE_NAME}/{CHECKPOINT_CONTAINER}")
@@ -122,9 +114,8 @@ def patch_active_agent(tenantId, userId, sessionId, activeAgent):
             f"[ERROR] Error patching active agent for tenantId: {tenantId}, userId: {userId}, sessionId: {sessionId}: {e}")
         raise e
 
-    # deletes the user data from the container by tenantId, userId, sessionId
 
-
+# deletes the user data from the container by tenantId, userId, sessionId
 def delete_userdata_item(tenantId, userId, sessionId):
     try:
         query = f"SELECT * FROM c WHERE c.tenantId = '{tenantId}' AND c.userId = '{userId}' AND c.sessionId = '{sessionId}'"
@@ -141,52 +132,6 @@ def delete_userdata_item(tenantId, userId, sessionId):
         raise e
 
 
-# Create the "Account" container partitioned by accountId
-
-
-# Function to create an account record
-# def create_account_record(account_data):
-#     try:
-#         account_container.upsert_item(account_data)
-#         print(f"[DEBUG] Account record created: {account_data}")
-#     except Exception as e:
-#         print(f"[ERROR] Error creating account record: {e}")
-#         raise e
-#
-#
-#
-#
-#
-# def fetch_latest_account_number():
-#     try:
-#         query = "SELECT VALUE MAX(c.accountId) FROM c"
-#         items = list(account_container.query_items(query=query, enable_cross_partition_query=True))
-#         print(f"[DEBUG] Fetched {len(items)} account numbers")
-#         if items:
-#             latest_account_id = items[0]
-#             if latest_account_id is None:
-#                 return 0
-#             print(f"[DEBUG] Latest account ID: {latest_account_id}")
-#             latest_account_number = int(latest_account_id[1:])  # Assuming accountId is in the format 'a<number>'
-#             print(f"[DEBUG] Latest account number: {latest_account_number}")
-#             return latest_account_number
-#
-#         else:
-#             return None
-#     except Exception as e:
-#         print(f"[ERROR] Error fetching latest account number: {e}")
-#         raise e
-#
-#
-# # Function to create a transaction record
-# def create_transaction_record(transaction_data):
-#     try:
-#         account_container.upsert_item(transaction_data)
-#         print(f"[DEBUG] Transaction record created: {transaction_data}")
-#     except Exception as e:
-#         print(f"[ERROR] Error creating transaction record: {e}")
-#         raise e
-
 vector_embedding_policy = {
     "vectorEmbeddings": [
         {
@@ -198,26 +143,15 @@ vector_embedding_policy = {
     ]
 }
 
-# full_text_policy = {
-#     "defaultLanguage": "en-US",
-#     "fullTextPaths": [
-#         {
-#             "path": "/product_description",
-#             "language": "en-US",
-#         }
-#     ]
-# }
-
 indexing_policy = {
     "indexingMode": "consistent",
     "includedPaths": [{"path": "/*"}],
     "excludedPaths": [{"path": '/"_etag"/?'}],
     "vectorIndexes": [{"path": "/embedding", "type": "diskANN"}],
-    #"fullTextIndexes": [{"path": "/product_description"}],
 }
 
 
-# Create Containers with Vector and Full-Text Indexing Policies
+# Create Containers with Vector Indexing Policies
 def create_containers():
     try:
         users_container = database.create_container_if_not_exists(
@@ -245,7 +179,6 @@ def create_containers():
             partition_key=PartitionKey(path="/category"),
             offer_throughput=10000,
             vector_embedding_policy=vector_embedding_policy,
-            #full_text_policy=full_text_policy,
             indexing_policy=indexing_policy,
         )
 
@@ -291,7 +224,7 @@ def add_purchase(user_id, date_of_purchase, item_id, amount, product_name, categ
 
 def add_product(product_id, product_name, category, product_description, price):
     container = database.get_container_client(PRODUCTS_CONTAINER)
-    product_description_vector = azure_open_ai.generate_embedding(product_description)
+    product_description_vector = generate_embedding(product_description)
     product = {
         "id": str(uuid.uuid4()),
         "product_id": product_id,
@@ -305,25 +238,6 @@ def add_product(product_id, product_name, category, product_description, price):
         container.create_item(body=product)
     except exceptions.CosmosResourceExistsError:
         print(f"Product with product_id {product_id} already exists.")
-
-
-import os
-import json
-import uuid
-import sys
-import time
-import concurrent.futures
-from typing import List, Optional
-from azure.cosmos import ContainerProxy
-
-import os
-import json
-import uuid
-import sys
-import time
-import concurrent.futures
-from typing import List, Optional
-from azure.cosmos import ContainerProxy
 
 
 def process_and_insert_data(
@@ -359,21 +273,10 @@ def process_and_insert_data(
 
             # Generate vector embedding
             if vector_field and vector_field in entry and isinstance(entry[vector_field], str):
-                entry["embedding"] = azure_open_ai.generate_embedding(entry[vector_field])
+                entry["embedding"] = generate_embedding(entry[vector_field])
 
             # Assign a unique ID
             entry["id"] = str(uuid.uuid4())
-
-            # Add an empty text field
-            entry["text"] = ""
-
-            # Ensure metadata exists
-            entry["metadata"] = entry.get("metadata", {})
-
-            # Copy relevant fields into metadata
-            for field in ["product_description", "product_id", "product_name", "category", "price", "id"]:
-                if field in entry:
-                    entry["metadata"][field] = entry[field]
 
             # Check document size
             size = sys.getsizeof(json.dumps(entry))
@@ -425,42 +328,6 @@ def process_and_insert_data(
     print(f"  - Failed processing: {failed_processing_count}")
     print(f"  - Inserted successfully: {inserted_count}")
     print(f"  - Failed inserts: {failed_insert_count}")
-
-
-# def process_and_insert_data(
-#         filename: str,
-#         container: ContainerProxy,
-#         vector_field: Optional[str] = None,
-#         full_text_fields: Optional[List[str]] = None,
-# ):
-#     if not os.path.exists(filename):
-#         print(f"File {filename} not found.")
-#         return
-#
-#     with open(filename, "r") as f:
-#         data = json.load(f)
-#
-#     if len(data) > 300:
-#         data = data[226:]
-#
-#     for entry in data:
-#         if full_text_fields is not None:
-#             for field in full_text_fields:
-#                 if field in entry and isinstance(entry[field], list):
-#                     entry[field] = [", ".join(map(str, entry[field]))]
-#
-#         # Generate vector embedding
-#         if vector_field and vector_field in entry and isinstance(entry[vector_field], str):
-#             entry["embedding"] = azure_open_ai.generate_embedding(entry[vector_field])
-#
-#         # Insert into CosmosDB
-#         entry["id"] = str(uuid.uuid4())
-#         size = sys.getsizeof(json.dumps(entry))
-#         if size > 2 * 1024 * 1024:  # 2MB in bytes
-#             print(f"Document {entry['id']} is too large: {size} bytes")
-#         container.upsert_item(entry)
-#
-#     print(f"Inserted data from {filename} into {container.id}.")
 
 
 def main():

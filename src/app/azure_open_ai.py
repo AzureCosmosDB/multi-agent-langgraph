@@ -17,7 +17,6 @@ model = AzureChatOpenAI(
     api_version=azure_openai_api_version,
     temperature=0,
 )
-print("[DEBUG] Azure OpenAI model initialized successfully.")
 
 def generate_embedding(text):
     response = aoai_client.embeddings.create(input=text, model=os.getenv("AZURE_OPENAI_EMBEDDINGDEPLOYMENTID"))

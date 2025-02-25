@@ -1,0 +1,9 @@
+azure-cosmos==4.10.0b1
+colorama==0.4.6
+gradio==5.18.0
+langchain==0.3.19
+langchain_core==0.3.39
+langchain_openai==0.3.7
+langgraph==0.2.74
+langgraph_checkpoint_cosmosdb==0.2.3
+openai==1.64.0

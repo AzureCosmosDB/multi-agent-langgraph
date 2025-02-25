@@ -1,8 +1,7 @@
-import os
-from typing import Literal, List, Dict, Any
+from typing import Literal, Any
 from typing import Annotated
 
-from azure.cosmos import PartitionKey
+from colorama import Fore, Style
 from langchain_core.tools.base import InjectedToolCallId
 from langgraph.prebuilt import create_react_agent, InjectedState
 from langchain_core.tools import tool
@@ -10,49 +9,59 @@ from langgraph.graph import StateGraph, START, MessagesState
 from langgraph.prebuilt import create_react_agent
 from langgraph.types import Command, interrupt
 from langgraph_checkpoint_cosmosdb import CosmosDBSaver
-from azure_open_ai import model
 import datetime
 import azure_cosmos_db
-import azure_open_ai
 from azure_cosmos_db import DATABASE_NAME, CHECKPOINT_CONTAINER, PRODUCTS_CONTAINER, userdata_container, patch_active_agent, \
     update_userdata_container, get_cosmos_client
-from langchain_community.vectorstores.azure_cosmos_db_no_sql import (
-    AzureCosmosDBNoSqlVectorSearch, CosmosDBQueryType,
-)
-# from langchain.embeddings import OpenAIEmbeddings
-# from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_openai import AzureOpenAIEmbeddings
-from azure_open_ai import model
+from azure_open_ai import model, generate_embedding
 
 
 ########
 # Tools ############################################################################################################
 ########
 
-# vector store
-partition_key = PartitionKey(path="/category")
-cosmos_container_properties = {"partition_key": partition_key}
+# Perform a vector search on the Cosmos DB container.
+# Note: in this case we are using Cosmos DB's native SDKs to perform the vector search instead of
+# using the langchain_cosmosdb vector store integration, because the latter's current implementation
+# requires any additional fields that you want to return, other than the embedding field, to be defined
+# within a metadata json field. This can mean duplicating fields that we need as part of the search,
+# but that might already be present in the transactional store. As such, the langchain integration assumes
+# that the vector store is being used ONLY as a vector store, and not also as a transactional store.
+def vector_search(vectors, similarity_score=0.02, num_results=2):
+    # Execute the query
+    database = azure_cosmos_db.client.get_database_client(DATABASE_NAME)
+    container = database.get_container_client(PRODUCTS_CONTAINER)
+    results = container.query_items(
+        query='''
+        SELECT TOP @num_results c.product_id, c.product_name, c.category, c.price, c.product_description, VectorDistance(c.embedding, @embedding) as SimilarityScore 
+        FROM c
+        WHERE VectorDistance(c.embedding,@embedding) > @similarity_score
+        ORDER BY VectorDistance(c.embedding,@embedding)
+        ''',
+        parameters=[
+            {"name": "@embedding", "value": vectors},
+            {"name": "@num_results", "value": num_results},
+            {"name": "@similarity_score", "value": similarity_score}
+        ],
+        enable_cross_partition_query=True, populate_query_metrics=True)
+    print("Executed vector search in Azure Cosmos DB... \n")
+    results = list(results)
+    # Extract the necessary information from the results
+    formatted_results = []
+    for result in results:
+        score = result.pop('SimilarityScore')
+        formatted_result = {
+            'SimilarityScore': score,
+            'document': result
+        }
+        formatted_results.append(formatted_result)
+    return formatted_results
 
-# Initialize LangChain's CosmosDB vector store
-# If the documents already exist in the container
-vector_store = AzureCosmosDBNoSqlVectorSearch(
-    embedding=AzureOpenAIEmbeddings(
-        model="text-embedding-ada-002"
-    ),
-    cosmos_client=get_cosmos_client(),
-    database_name=DATABASE_NAME,
-    container_name=PRODUCTS_CONTAINER,
-    vector_embedding_policy=azure_cosmos_db.vector_embedding_policy,
-    indexing_policy=azure_cosmos_db.indexing_policy,
-    #full_text_policy=azure_cosmos_db.full_text_policy,
-    cosmos_database_properties={},
-    cosmos_container_properties=cosmos_container_properties,
-    embedding_key="embedding",
-    create_container=False,
-)
+def transfer_to_agent_message(agent):
+    print(Fore.LIGHTMAGENTA_EX + f"transfer_to_{agent}..." + Style.RESET_ALL)
 
 def create_agent_transfer(*, agent_name: str):
-    """Create a tool that can return handoff via a Command"""
+    """Create a tool that can do agent transfer"""
     tool_name = f"transfer_to_{agent_name}"
 
     @tool(tool_name)
@@ -67,6 +76,7 @@ def create_agent_transfer(*, agent_name: str):
             "name": tool_name,
             "tool_call_id": tool_call_id,
         }
+        transfer_to_agent_message(agent_name)
         return Command(
             goto=agent_name,
             graph=Command.PARENT,
@@ -79,7 +89,6 @@ def refund_item(user_id, product_id):
     """Initiate a refund based on the user ID and product ID.
     Takes as input arguments in the format '{"user_id":1,"product_id":3}'
     """
-    print("In refund_item tool............")
     try:
         database = azure_cosmos_db.client.get_database_client(azure_cosmos_db.DATABASE_NAME)
         container = database.get_container_client(azure_cosmos_db.PURCHASE_HISTORY_CONTAINER)
@@ -105,7 +114,6 @@ def refund_item(user_id, product_id):
 def notify_customer(user_id, method):
     """Notify a customer by their preferred method of either phone or email.
     Takes as input arguments in the format '{"user_id":1,"method":"email"}'"""
-    print("In notify_customer tool............")
     try:
         database = azure_cosmos_db.client.get_database_client(azure_cosmos_db.DATABASE_NAME)
         container = database.get_container_client(azure_cosmos_db.USERS_CONTAINER)
@@ -130,7 +138,6 @@ def notify_customer(user_id, method):
 def order_item(user_id, product_id):
     """Place an order for a product based on the user ID and product ID.
     Takes as input arguments in the format '{"user_id":1,"product_id":2}'"""
-    print("In order_item tool............")
     try:
         date_of_purchase = datetime.datetime.now().strftime("%d/%m/%Y")
 
@@ -160,41 +167,10 @@ def order_item(user_id, product_id):
 def product_information(user_prompt: str) -> list[dict[str, Any]]:
     """Provide information about a product based on the user prompt.
     Takes as input the user prompt as a string."""
-
-    print("In product_information tool............")
-    print(f"Performing a vector search in Azure Cosmos DB for: {user_prompt}")
-
-    try:
-        search_results = vector_store.similarity_search_with_score(
-            query=user_prompt, k=5,
-            query_type=CosmosDBQueryType.VECTOR,
-        )
-
-        formatted_results = [
-            {
-                "SimilarityScore": score,
-                "document": {key: doc.metadata.get(key) for key in
-                             ["product_id", "product_name", "category", "price", "product_description"]}
-            }
-            for doc, score in search_results
-        ]
-
-    except Exception as e:
-        print(f"An error occurred during vector search: {e}")
-        return []
-
-    product_info = "\n\n".join(
-        f"Product ID: {doc['product_id']}\n"
-        f"Name: {doc['product_name']}\n"
-        f"Category: {doc['category']}\n"
-        f"Price: {doc['price']}\n"
-        f"Description: {doc['product_description']}"
-        for result in formatted_results for doc in [result['document']]
-    )
-
-    # print(product_info)  # Optional: Log results
-
-    return formatted_results
+    # Perform a vector search on the Cosmos DB container and return results to the agent
+    vectors = generate_embedding(user_prompt)
+    search_results = vector_search(vectors)
+    return search_results
 
 ########
 # Agents ############################################################################################################
@@ -253,9 +229,8 @@ refunds_agent = create_react_agent(
     refunds_agent_tools,
     state_modifier=(
         "You are a refund agent that handles all actions related to refunds after a return has been processed. "
-        "You must ask for both the user ID and product ID to initiate a refund. If product_id is present in the context information, use it. "
-        "Otherwise, do not make any assumptions, you must ask for the product ID as well."
-        "Ask for both user_id and product_id in one message. "
+        "If product id and user id is present in the context information, confirm with the user that they are correct. "
+        "If not present, you must ask for both the user ID and product ID to initiate a refund. "
         "Do not use any other context information to determine whether the right user id or product id has been provided - just accept the input as is. "
         "If the user asks you to notify them, you must ask them what their preferred method of notification is. For notifications, you must "
         "ask them for user_id and method in one message."
@@ -278,7 +253,7 @@ sales_agent = create_react_agent(
     state_modifier=(
         "You are a sales agent that handles all actions related to placing an order to purchase a product."
         "Regardless of what the user wants to purchase, must ask for the user ID. "
-        "If the product id is present in the context information, use it. Otherwise, you must as for the product ID as well. "
+        "If the product id is present in the context information, use it. Otherwise, you must ask for the product ID as well. "
         "An order cannot be placed without these two pieces of information. Ask for both user_id and product_id in one message. "
         "If the user asks you to notify them, you must ask them what their preferred method is. For notifications, you must "
         "ask them for user_id and method in one message."
@@ -290,8 +265,15 @@ sales_agent = create_react_agent(
 def call_triage_agent(state: MessagesState, config) -> Command[Literal["triage_agent", "human"]]:
     thread_id = config["configurable"].get("thread_id", "UNKNOWN_THREAD_ID")  # Get thread_id from config
 
+    # Get the active agent from the userdata container
+    # the userdata container is a Cosmos DB container that stores each user session id.
+    # The sessionId maps to the thread_id in the checkpointer store (named 'Chat').
+    # The checkpointer store is used to store the state of the conversation.
+    # the userdata container is modelled using hierarchical partitioning to allow multi-tenancy.
+    # In this sample, a single tenant and user is hardcoded for simplicity.
+    # This can be adapted to serve multiple tenants and users.
     activeAgent = userdata_container.query_items(
-        query=f"SELECT c.activeAgent FROM c WHERE c.id = '{thread_id}'",
+        query=f"SELECT c.activeAgent FROM c WHERE c.id = '{thread_id}' and c.tenantId = 'cli-test' and c.userId = 'cli-test' and c.sessionId = '{thread_id}'",
         enable_cross_partition_query=True
     )
     result = list(activeAgent)
@@ -312,25 +294,18 @@ def call_triage_agent(state: MessagesState, config) -> Command[Literal["triage_a
                 "messages": []
             })
         active_agent_value = None  # or handle the case where no result is found
-    # print(f"Active agent: {active_agent_value}")
+
     # if active agent is something other than unknown or triage_agent,
     # then transfer directly to that agent to respond to the last collected user input
-    # Note: this should be redundant (never called) as we get last agent from latest graph state in checkpoint
-    # and route back to it using that (see get_chat_completion in multi_agent_service_api.py).
-    # However, left it implemented for belt and braces.
-
     if active_agent_value is not None and active_agent_value != "unknown" and active_agent_value != "triage_agent":
-        print(f"routing straight to active agent: ", active_agent_value)
         return Command(update=state, goto=active_agent_value)
     else:
         response = triage_agent.invoke(state)
-        print(f"collecting user input")
         return Command(update=response, goto="human")
 
 
 def call_product_agent(state: MessagesState, config) -> Command[Literal["sales_agent", "human"]]:
     thread_id = config["configurable"].get("thread_id", "UNKNOWN_THREAD_ID")
-    print(f"Routing to product agent")
     if local_interactive_mode:
         patch_active_agent(tenantId="cli-test", userId="cli-test", sessionId=thread_id,
                            activeAgent="product_agent")
@@ -341,7 +316,6 @@ def call_product_agent(state: MessagesState, config) -> Command[Literal["sales_a
 def call_sales_agent(state: MessagesState, config) -> Command[Literal["sales_agent", "human"]]:
     thread_id = config["configurable"].get("thread_id", "UNKNOWN_THREAD_ID")
     # Get userId from state
-    print(f"Routing to sales agent")
     if local_interactive_mode:
         patch_active_agent(tenantId="cli-test", userId="cli-test", sessionId=thread_id,
                            activeAgent="sales_agent")
@@ -351,7 +325,6 @@ def call_sales_agent(state: MessagesState, config) -> Command[Literal["sales_age
 
 def call_refunds_agent(state: MessagesState, config) -> Command[Literal["refunds_agent", "human"]]:
     thread_id = config["configurable"].get("thread_id", "UNKNOWN_THREAD_ID")
-    print(f"Routing to refunds agent")
     if local_interactive_mode:
         patch_active_agent(tenantId="cli-test", userId="cli-test", sessionId=thread_id,
                            activeAgent="refunds_agent")
@@ -359,25 +332,12 @@ def call_refunds_agent(state: MessagesState, config) -> Command[Literal["refunds
     return Command(update=response, goto="human")
 
 
-# The human_node with interrupt function only serves as a mechanism to stop
-# the graph and collect user input. Since the graph is being exposed as an API, the Command object
-# return value will never be reached, and instead we route back to the agent that asked the question
-# by getting latest graph state from checkpoint and retrieving the last agent from there so we can route
-# to the right agent (see get_chat_completion in multi_agent_service_api.py).
-# In interactive mode, the Command object would be returned after user input collected, and the graph
-# would continue to the active agent per logic below.
-def human_node(state: MessagesState, config) -> Command[
-    Literal["triage_agent", "product_agent", "sales_agent", "refunds_agent", "human"]]:
+# The human_node with interrupt function serves as a mechanism to stop
+# the graph and collect user input for multi-turn conversations.
+def human_node(state: MessagesState, config) -> None:
     """A node for collecting user input."""
-    # print("Human node")
-    user_input = interrupt(value="Ready for user input.")
-    langgraph_triggers = config["metadata"]["langgraph_triggers"]
-    if len(langgraph_triggers) != 1:
-        raise AssertionError("Expected exactly 1 trigger in human node")
-    active_agent = langgraph_triggers[0].split(":")[1]
-    print(f"Active agent: {active_agent}")
-    return Command(update={"messages": [{"role": "human", "content": user_input}]}, goto=active_agent)
-
+    interrupt(value="Ready for user input.")
+    return None
 
 builder = StateGraph(MessagesState)
 builder.add_node("triage_agent", call_triage_agent)

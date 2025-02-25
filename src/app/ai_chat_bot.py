@@ -43,8 +43,9 @@ def chatbot(input_text, session_id, messages):
 with gr.Blocks(css=".chatbox { background-color: #f9f9f9; border-radius: 10px; padding: 10px; }") as demo:
     gr.Markdown(
         """
-        # AI Assistant
-        Welcome to your AI Assistant. Get help with various topics instantly!
+        # Personal Shopping AI Assistant
+        Welcome to your Personal Shopping AI Assistant. 
+        Get help with shopping, refunds, product information, and more!
         """,
         elem_id="header",
     )
